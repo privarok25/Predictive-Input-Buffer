@@ -9,6 +9,7 @@
 #include <Windows.h>
 #include <cstdio>
 #include <algorithm>
+#include <deque>
 
 using namespace geode::prelude;
 
@@ -36,17 +37,22 @@ private:
     // Tracks actual physical mouse state vs what PlayLayer currently has active
     bool m_physicalHolding = false;
     bool m_gameHolding = false;
+    // If death occurs while the physical key is held, wait for a real release
+    // before accepting another press. This prevents synthetic re-presses on respawn.
+    bool m_waitForReleaseAfterDeath = false;
 
-    // F6 Cycle State (Starts on Stage 0: 2 ticks Normal / 2 ticks Wave)
+    // F6 cycle starts on Stage 1: 1 tick Normal / 1 tick Wave.
     int  m_presetIndex = 0;
     bool m_enabled = true;
-    int  m_maxTicksNormal = 2;
-    int  m_maxTicksWave = 2;
+    // Experimental ship helper remains disabled; F8 also explicitly forces it OFF.
+    bool m_shipPrecisionEnabled = false;
+    int  m_maxTicksNormal = 1;
+    int  m_maxTicksWave = 1;
 
     // Buffer state
     int  m_waitTicks = -1;          // -1 = inactive, >= 0 = countdown ticks, -2 = queued opposite tick
     bool m_bufferedPush = true;     // true = buffered PRESS, false = buffered RELEASE
-    bool m_queuedOpposite = false;  // true if user quickly released/re-pressed during wait
+    std::deque<bool> m_queuedInputs; // preserve every alternating edge while a buffered input is pending
     float m_frameDt = 0.25f;        // GD 240 TPS normalized dt is 0.25f
 
     // Streak-based Spam Guard state
@@ -96,16 +102,13 @@ private:
 
     // Clear transient input state between attempts. In particular, never carry
     // a buffered edge or rapid-input streak through death/restart.
-    void resetAttemptInputState(bool physicalHeld = false, bool gameHeld = false) {
+    void resetAttemptInputState(bool physicalHeld = false) {
         m_waitTicks = -1;
         m_bufferedPush = true;
-        m_queuedOpposite = false;
-        // Keep the actual device state separate from the game's logical state.
-        // On death, the player/game state is reset, but the user may still be
-        // physically holding the button. Conflating the two can turn OS/game
-        // repeat notifications into false press edges (and inflate CPS).
+        m_queuedInputs.clear();
         m_physicalHolding = physicalHeld;
-        m_gameHolding = gameHeld;
+        m_gameHolding = false;
+        m_waitForReleaseAfterDeath = physicalHeld;
         m_firingBuffered = false;
         m_ticksSinceLastInput = 999;
         m_rapidInputStreak = 0;
@@ -135,45 +138,52 @@ public:
         resetAttemptInputState(false);
     }
 
-    // Cycles through the 5 F6 stages:
-    // 0: 2 All / 2 Wave -> 1: 4 All / 4 Wave -> 2: 8 All / 8 Wave -> 3: 16 All / 8 Wave -> 4: OFF
+    // Cycles through 6 F6 stages:
+    // 1: 1/1 -> 2: 2/2 -> 3: 4/4 -> 4: 8/8 -> 5: 16/8 -> 6: OFF.
     void cyclePreset() {
-        m_presetIndex = (m_presetIndex + 1) % 5;
+        m_presetIndex = (m_presetIndex + 1) % 6;
         m_waitTicks = -1;
-        m_queuedOpposite = false;
+        m_queuedInputs.clear();
 
         switch (m_presetIndex) {
             case 0:
                 m_enabled = true;
-                m_maxTicksNormal = 2;
-                m_maxTicksWave = 2;
-                printf("[InputBuffer] F6 Cycle -> STAGE 1: 2 Ticks All | 2 Ticks Wave (0.5f @ 60fps)\n");
+                m_maxTicksNormal = 1;
+                m_maxTicksWave = 1;
+                printf("[InputBuffer] F6 Cycle -> STAGE 1: 1 Tick All | 1 Tick Wave (0.25f @ 60fps)\n");
                 break;
             case 1:
                 m_enabled = true;
-                m_maxTicksNormal = 4;
-                m_maxTicksWave = 4;
-                printf("[InputBuffer] F6 Cycle -> STAGE 2: 4 Ticks All | 4 Ticks Wave (1.0f @ 60fps)\n");
+                m_maxTicksNormal = 2;
+                m_maxTicksWave = 2;
+                printf("[InputBuffer] F6 Cycle -> STAGE 2: 2 Ticks All | 2 Ticks Wave (0.5f @ 60fps)\n");
                 break;
             case 2:
                 m_enabled = true;
-                m_maxTicksNormal = 8;
-                m_maxTicksWave = 8;
-                printf("[InputBuffer] F6 Cycle -> STAGE 3: 8 Ticks All | 8 Ticks Wave (2.0f @ 60fps)\n");
+                m_maxTicksNormal = 4;
+                m_maxTicksWave = 4;
+                printf("[InputBuffer] F6 Cycle -> STAGE 3: 4 Ticks All | 4 Ticks Wave (1.0f @ 60fps)\n");
                 break;
             case 3:
                 m_enabled = true;
-                m_maxTicksNormal = 16;
+                m_maxTicksNormal = 8;
                 m_maxTicksWave = 8;
-                printf("[InputBuffer] F6 Cycle -> STAGE 4: 16 Ticks All | 8 Ticks Wave (4.0f / 2.0f @ 60fps)\n");
+                printf("[InputBuffer] F6 Cycle -> STAGE 4: 8 Ticks All | 8 Ticks Wave (2.0f @ 60fps)\n");
                 break;
             case 4:
+                m_enabled = true;
+                m_maxTicksNormal = 16;
+                m_maxTicksWave = 8;
+                printf("[InputBuffer] F6 Cycle -> STAGE 5: 16 Ticks All | 8 Ticks Wave (4.0f / 2.0f @ 60fps)\n");
+                break;
+            case 5:
                 m_enabled = false;
                 m_maxTicksNormal = 0;
                 m_maxTicksWave = 0;
-                printf("[InputBuffer] F6 Cycle -> STAGE 5: OFF (100%% Raw Input)\n");
+                printf("[InputBuffer] F6 Cycle -> STAGE 6: OFF (100%% Raw Input)\n");
                 break;
         }
+        fflush(stdout);
     }
 
     bool isSimulating() const { return m_simulating; }
@@ -184,11 +194,10 @@ public:
             m_simulationDead = true;
             return true;
         }
-        // Only reset when the real player actually dies (this hook is called
-        // from destroyPlayer). Clear queued input, but preserve the real device
-        // state. The game's logical button state starts released for the next
-        // attempt, so onPlayerUpdate can reconcile it with a still-held key.
-        resetAttemptInputState(m_physicalHolding, false);
+        // Real player died -> discard pending actions. If the physical key is
+        // still held, require a genuine release before allowing a new press.
+        // This avoids the game-state resync synthesizing a press after respawn.
+        resetAttemptInputState(m_physicalHolding);
         return false;
     }
 
@@ -229,8 +238,8 @@ public:
 
         float dt = getValidDt();
         int survived = 0;
-        bool isContinuousMode = realP1->m_isDart || realP1->m_isBird || realP1->m_isSwing ||
-                                (isDual && realP2 && (realP2->m_isDart || realP2->m_isBird || realP2->m_isSwing));
+        bool isContinuousMode = realP1->m_isDart || realP1->m_isBird || realP1->m_isSwing || realP1->m_isShip ||
+                                (isDual && realP2 && (realP2->m_isDart || realP2->m_isBird || realP2->m_isSwing || realP2->m_isShip));
         int airborneTicks = 0;
         int safeLandedTicks = 0;
 
@@ -305,19 +314,37 @@ public:
             return true;
         }
 
-        // Ignore duplicate state notifications (e.g. repeated key-down events while
-        // a key is held). Only a real up/down edge should reach the gameplay path;
-        // otherwise repeat events can be counted as an excessive CPS stream.
-        if (push == m_physicalHolding) {
+        // Capture the prior physical state before updating it. Some input paths
+        // can report the same button edge more than once; treating a duplicate
+        // DOWN as a fresh edge can create an extra click (e.g. 1 CPS -> 2 CPS).
+        const bool wasPhysicalHolding = m_physicalHolding;
+        m_physicalHolding = push;
+
+        // After a death during a held input, ignore presses until a real release
+        // arrives. Pass the release through and then re-arm the buffer.
+        if (m_waitForReleaseAfterDeath) {
+            if (!push) {
+                m_waitForReleaseAfterDeath = false;
+                m_gameHolding = false;
+                m_waitTicks = -1;
+                m_queuedInputs.clear();
+                m_ticksSinceLastInput = 999;
+                m_rapidInputStreak = 0;
+                return true;
+            }
             return false;
         }
-
-        // Always record the user's true physical mouse/key state first!
-        m_physicalHolding = push;
 
         if (!m_enabled) {
             m_gameHolding = push;
             return true;
+        }
+
+        // Only real state transitions are valid edges. Consume duplicate DOWN /
+        // UP notifications while the buffer is active, before they can enter the
+        // prediction path or queue. Raw-input mode (F6 OFF) remains untouched.
+        if (push == wasPhysicalHolding) {
+            return false;
         }
 
         PlayerObject* p1 = layer->m_player1;
@@ -326,7 +353,7 @@ public:
             // Inputs during death/restart are passed through raw, but must not
             // leave a pending buffered action or spam-guard history behind.
             m_waitTicks = -1;
-            m_queuedOpposite = false;
+            m_queuedInputs.clear();
             m_bufferedPush = true;
             m_gameHolding = push;
             m_ticksSinceLastInput = 999;
@@ -334,34 +361,63 @@ public:
             return true;
         }
 
-        // 1. NEVER touch Ship mode (or Dual with Ship)
-        if (p1->m_isShip || (isDual && p2 && p2->m_isShip)) {
+        // Ship stays on raw input. This helper is intentionally disabled; no ship
+        // inputs are buffered by the current build.
+        bool isShip = p1->m_isShip || (isDual && p2 && p2->m_isShip);
+        if (isShip && !m_shipPrecisionEnabled) {
             m_waitTicks = -1;
-            m_queuedOpposite = false;
+            m_queuedInputs.clear();
             m_gameHolding = push;
             return true;
         }
 
-        // 2. If an input is currently waiting in the buffer and the user quickly releases
-        // (or re-presses) 1-2 ticks later, queue it for the next tick so fast taps are never eaten
-        if (m_waitTicks >= 0) {
-            if (push != m_bufferedPush) {
-                m_queuedOpposite = true;
-            } else {
-                m_queuedOpposite = false;
+        // Keep edge order while a predicted input is pending. If another physical
+        // edge arrives before the prediction delay expires, flush the pending edge
+        // and all queued transitions immediately, in order. Waiting for one edge per
+        // PlayerObject::update can make a tight Wave press/release arrive too late.
+        auto enqueueEdge = [this](bool state) {
+            bool lastScheduled = m_queuedInputs.empty()
+                ? (m_waitTicks >= 0 ? m_bufferedPush : m_gameHolding)
+                : m_queuedInputs.back();
+            if (state != lastScheduled) m_queuedInputs.push_back(state);
+        };
+        auto flushPendingEdges = [this, pl]() {
+            if (m_waitTicks >= 0) {
+                const bool pendingState = m_bufferedPush;
+                m_waitTicks = -1;
+                if (m_gameHolding != pendingState) {
+                    m_SimFireButton(pl, pendingState);
+                }
             }
+            while (!m_queuedInputs.empty()) {
+                const bool nextState = m_queuedInputs.front();
+                m_queuedInputs.pop_front();
+                if (m_gameHolding != nextState) {
+                    m_SimFireButton(pl, nextState);
+                }
+            }
+            // The physical state is authoritative; recover if the queue and game
+            // state somehow diverged while processing a burst of edges.
+            if (m_gameHolding != m_physicalHolding) {
+                m_SimFireButton(pl, m_physicalHolding);
+            }
+        };
+
+        if (m_waitTicks >= 0) {
+            enqueueEdge(push);
+            flushPendingEdges();
             m_ticksSinceLastInput = 0;
             return false;
         }
 
-        // If a queued opposite action is due to fire on the next tick (m_waitTicks == -2)
-        // and the user clicks again, fire the pending opposite action first
-        if (m_waitTicks == -2) {
-            m_waitTicks = -1;
-            m_queuedOpposite = false;
-            if (m_gameHolding != !m_bufferedPush) {
-                m_SimFireButton(pl, !m_bufferedPush);
-            }
+        // A queue should normally be empty outside a pending prediction. If an
+        // older pending sequence exists, resolve it now rather than dropping a
+        // new Wave edge or leaving the queue behind the real input.
+        if (!m_queuedInputs.empty()) {
+            enqueueEdge(push);
+            flushPendingEdges();
+            m_ticksSinceLastInput = 0;
+            return false;
         }
 
         bool isWave = p1->m_isDart || (isDual && p2 && p2->m_isDart);
@@ -383,20 +439,23 @@ public:
             return true;
         }
 
-        // Only Wave (m_isDart) and Robot (m_isRobot) change trajectory on RELEASE
-        bool releaseAffectsPhysics = p1->m_isDart || p1->m_isRobot ||
-                                     (isDual && p2 && (p2->m_isDart || p2->m_isRobot));
+        // Release changes trajectory for Wave, Robot, and Ship.
+        bool releaseAffectsPhysics = p1->m_isDart || p1->m_isRobot || p1->m_isShip ||
+                                     (isDual && p2 && (p2->m_isDart || p2->m_isRobot || p2->m_isShip));
         if (!push && !releaseAffectsPhysics) {
             m_gameHolding = false;
             return true;
         }
 
-        m_queuedOpposite = false;
+        m_queuedInputs.clear();
         const char* act = push ? "PRESS" : "RELEASE";
 
-        // Full Show-Trajectory lookahead for Wave (65 ticks / 50 ticks Mini Wave)
-        // so it sees spikes and sawblades 1-3 blocks ahead along the diagonal path!
-        int targetHorizon = isMiniWave ? 50 : (isWave ? 65 : 160);
+        // Extended trajectory lookahead. The collision-object scratch vector below
+        // is reused to reduce allocations while scanning longer horizons.
+        // Ship prediction deliberately uses a short horizon. Long simulated
+        // straight-fly predictions drift from live state and must not trigger
+        // buffering. Only a near-term, clearly survivable delayed edge qualifies.
+        int targetHorizon = isShip ? 40 : (isMiniWave ? 60 : (isWave ? 80 : 200));
         int maxDelayFrames = isWave ? m_maxTicksWave : m_maxTicksNormal;
 
         // 4. Check Frame 0 (immediate input) across the full trajectory horizon
@@ -430,6 +489,16 @@ public:
                     bestTicks = ticks;
                     if (ticks >= targetHorizon) break;
                 }
+            } else if (isShip) {
+                // Ship Precision is intentionally conservative: only buffer if
+                // the current edge predicts a collision very soon, and a small
+                // delay survives the entire short horizon. Never optimize a
+                // long straight flight based on speculative distant collisions.
+                if (ticksFrame0 <= 20 && ticks >= targetHorizon) {
+                    bestDelay = delay;
+                    bestTicks = ticks;
+                    break;
+                }
             } else {
                 if (ticks >= targetHorizon) {
                     bestDelay = delay;
@@ -459,20 +528,50 @@ public:
         PlayLayer* pl = PlayLayer::get();
         if (!pl || player != pl->m_player1) return;
 
-        // Check F6 before m_enabled check so you can always cycle back ON when it is OFF!
+        // F6 cycles stages, F7 toggles console, F8 disables all stages and ship prediction.
         if (GetAsyncKeyState(VK_F6) & 1) {
             cyclePreset();
         }
+        if (GetAsyncKeyState(VK_F8) & 1) {
+            m_presetIndex = 5;
+            m_enabled = false;
+            m_maxTicksNormal = 0;
+            m_maxTicksWave = 0;
+            m_shipPrecisionEnabled = false;
+            m_waitTicks = -1;
+            m_queuedInputs.clear();
+            m_rapidInputStreak = 0;
+            m_ticksSinceLastInput = 999;
+            // Release/press any state left pending before switching to raw input.
+            if (m_gameHolding != m_physicalHolding) {
+                m_SimFireButton(pl, m_physicalHolding);
+            }
+            printf("[InputBuffer] F8 -> ALL STAGES + SHIP PREDICTIVE OFF (raw input)\n");
+            fflush(stdout);
+        }
+        if (GetAsyncKeyState(VK_F7) & 1) {
+            HWND console = GetConsoleWindow();
+            if (console) {
+                static bool consoleVisible = true;
+                consoleVisible = !consoleVisible;
+                ShowWindow(console, consoleVisible ? SW_SHOW : SW_HIDE);
+            }
+        }
 
         if (!m_enabled) return;
+
+        // Do not let the normal state-sync path manufacture a press while the
+        // physical button is still held from the previous attempt.
+        if (m_waitForReleaseAfterDeath) return;
 
         if (m_ticksSinceLastInput < 999) {
             m_ticksSinceLastInput++;
         }
 
-        if (player->m_isShip || (pl->m_gameState.m_isDualMode && pl->m_player2 && pl->m_player2->m_isShip)) {
+        bool isShip = player->m_isShip || (pl->m_gameState.m_isDualMode && pl->m_player2 && pl->m_player2->m_isShip);
+        if (isShip && !m_shipPrecisionEnabled) {
             m_waitTicks = -1;
-            m_queuedOpposite = false;
+            m_queuedInputs.clear();
             if (m_gameHolding != m_physicalHolding) {
                 m_SimFireButton(pl, m_physicalHolding);
             }
@@ -481,21 +580,20 @@ public:
 
         if (m_waitTicks == 0) {
             m_SimFireButton(pl, m_bufferedPush);
-            if (m_queuedOpposite) {
-                m_waitTicks = -2;
-                m_queuedOpposite = false;
-            } else {
-                m_waitTicks = -1;
-            }
+            m_waitTicks = -1;
         } else if (m_waitTicks > 0) {
             m_waitTicks--;
-        } else if (m_waitTicks == -2) {
-            m_SimFireButton(pl, !m_bufferedPush);
-            m_queuedOpposite = false;
-            m_waitTicks = -1;
+        } else if (m_waitTicks == -1 && !m_queuedInputs.empty()) {
+            // Drain exactly one edge per update and only dispatch an actual state
+            // transition. This preserves press/release order without generating
+            // duplicate clicks when the queue and live state have converged.
+            bool nextState = m_queuedInputs.front();
+            m_queuedInputs.pop_front();
+            if (m_gameHolding != nextState) {
+                m_SimFireButton(pl, nextState);
+            }
         } else if (m_waitTicks == -1) {
-            // FAILSAFE: When no buffer is active, guarantee the game's hold state
-            // matches your actual physical mouse button so Wave/Mini Wave can NEVER stay stuck holding!
+            // Failsafe: keep the game state synchronized with the real physical state.
             if (m_gameHolding != m_physicalHolding) {
                 m_SimFireButton(pl, m_physicalHolding);
             }
@@ -521,10 +619,16 @@ $on_mod(Loaded) {
     freopen_s(&f, "CONOUT$", "w", stdout);
     SetConsoleTitleA("Geode Predictive Input Buffer - Live Console");
     printf("============================================================\n");
-    printf(" [InputBuffer] v4.6 LOADED (Wave Spikes/Saws Trajectory Fix)\n");
-    printf(" [InputBuffer] Starting Mode: STAGE 1 (2 All / 2 Wave)\n");
-    printf(" [InputBuffer] Press F6 in-level to cycle: 2/2 -> 4/4 -> 8/8 -> 16/8 -> OFF\n");
+    printf(" [InputBuffer] Prototype v0.9 loaded\n");
+    printf(" [InputBuffer] Starting Mode: STAGE 1 (1 All / 1 Wave)\n");
+    printf(" [InputBuffer] F6: cycle 1/1 -> 2/2 -> 4/4 -> 8/8 -> 16/8 -> OFF\n");
+    printf(" [InputBuffer] F7: hide/show this console\n");
+    printf(" [InputBuffer] F8: force ALL stages + ship prediction OFF (raw input)\n");
+    printf(" [InputBuffer] Ship inputs remain raw; ship helper disabled\n");
+    printf(" [InputBuffer] Edge-flush safety: pending predictions flush in order on a new physical edge\n");
+    printf(" [InputBuffer] Extended lookahead: Normal/Ship 200 / Wave 80 / Mini Wave 60 ticks\n");
     printf("============================================================\n");
+    fflush(stdout);
 }
 
 class $modify(BufPlayLayer, PlayLayer) {
@@ -659,8 +763,13 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
 
     void collisionCheckObjects(PlayerObject* player, gd::vector<GameObject*>* vec, int objectsCount, float dt) {
         if (s_sim.isSimulating()) {
-            gd::vector<GameObject*> extra;
-            extra.reserve(objectsCount);
+            // Reuse the same temporary vector on every simulated tick to avoid
+            // repeated heap allocations during trajectory prediction.
+            static gd::vector<GameObject*> extra;
+            extra.clear();
+            if (extra.capacity() < static_cast<size_t>(objectsCount)) {
+                extra.reserve(objectsCount);
+            }
             for (int i = 0; i < objectsCount; i++) {
                 GameObject* obj = vec->at(i);
                 if (!obj) continue;
